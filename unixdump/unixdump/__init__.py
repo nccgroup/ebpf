@@ -1,5 +1,3 @@
-#!/usr/bin/env python2
-
 # Copyright (c) 2018 NCC Group Security Services, Inc. All rights reserved.
 # Licensed under Dual BSD/GPLv2 per the repo LICENSE file.
 
@@ -8,6 +6,16 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 from bcc import BPF
+from .screen import is_in_screen
+from .session import get_session_type
+from .term_screen_x11 import get_screen_x11_current_terminal_pid
+from .term_screen_wayland import get_screen_wayland_current_terminal_pid
+from .term_tmux_x11 import get_tmux_x11_current_terminal_pid
+from .term_tmux_wayland import get_tmux_wayland_current_terminal_pid
+from .term_wayland import get_wayland_current_terminal_pid
+from .term_x11 import get_x11_current_terminal_pid
+from .tmux import is_in_tmux
+from .ud2b import extract_buffer
 import argparse
 import ctypes
 import hexdump
@@ -21,40 +29,6 @@ from subprocess import check_output, CalledProcessError
 import os
 import multiprocessing
 
-parser = argparse.ArgumentParser(description="Snoop on Unix Domain Sockets.")
-parser.add_argument("-r", "--ringsize", type=int, default=20, help="ring buffer size")
-parser.add_argument("-a", "--ancillarycount", type=int, default=2, help="max ancillary CMSG blocks to handle")
-parser.add_argument("-m", "--scmrightscount", type=int, default=4, help="max FDs in SCM_RIGHTS CMSG block to handle")
-parser.add_argument("-p", "--pid", type=int, help="trace only this pid")
-parser.add_argument("-x", "--exclude", nargs='+', default=[], help="exclude these pids")
-parser.add_argument("-s", "--socket", type=str, help="trace only this unix socket path")
-parser.add_argument("-b", "--beginswith", action='store_true', help="--socket will match starting sequences")
-parser.add_argument("-@", "--base64", action='store_true', help="--socket will be parsed as base64 for binary paths (assumes abstract namespace)")
-parser.add_argument("-c", "--color", action='store_true', help="output files with color")
-cwd = check_output(['pwd'], shell=False).strip()
-parser.add_argument("-o", "--dir", nargs='?',
-                    help="save output to files. defaults to $PWD", default=None, const=cwd)
-parser.add_argument("-z", "--stats", action='store_true', help="debug stats output")
-parser.add_argument("-d", "--debug", action='store_true', help="debug output")
-parser.add_argument("-y", "--retry", type=int, default=5, help="number of retry attempts for incomplete events")
-parser.add_argument("-l", "--ancillarydata", action='store_true', help="filter for ancillary data")
-
-args = parser.parse_args()
-
-if len(args.exclude) > 0:
-  args.exclude = [int(x) for x in args.exclude]
-
-if args.dir is not None and not os.path.isdir(args.dir):
-  parser.error("{} is not a directory.".format(args.dir))
-if args.color and not args.dir:
-  parser.error("color requires file output")
-if args.dir:
-  start_ts = int(time.time())
-if args.pid is not None:
-  start_command = check_output(['ps', '-q', str(args.pid), '-o', 'args='],
-                               shell=False).strip()
-if args.beginswith and not args.socket:
-  parser.error("beginswith requires socket")
 
 errors = {
   'SK_NOT_UNIX': 1,
@@ -72,23 +46,6 @@ errors = {
   'SK_PEER_NULL' : 13,
   'SK_NULL' : 14,
 }
-
-class bcolors:
-  BLUE = ''
-  RED = ''
-  ENDC = ''
-
-if args.color:
-  class bcolors:
-    # HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    # GREEN = '\033[92m'
-    # YELLOW = '\033[93m'
-    RED = '\033[91m'
-    ENDC = '\033[0m'
-    # BOLD = '\033[1m'
-    # UNDERLINE = '\033[4m'
-
 errors_rev = {v: k for k, v in errors.items()}
 
 error_defines = "\n"
@@ -96,6 +53,110 @@ error_defines = "\n"
 for k,v in errors.items():
   error_defines += "#define {} ((size_t){})\n".format(k, v)
 error_defines += "\n"
+
+class bcolors:
+  BLUE = ''
+  RED = ''
+  ENDC = ''
+
+pid_map = {}
+fd_map = {}
+pid_pair_map = {}
+
+def parse_args():
+  parser = argparse.ArgumentParser(description="Snoop on Unix Domain Sockets.")
+  parser.add_argument("-r", "--ringsize", type=int, default=20, help="ring buffer size")
+  parser.add_argument("-a", "--ancillarycount", type=int, default=2, help="max ancillary CMSG blocks to handle")
+  parser.add_argument("-m", "--scmrightscount", type=int, default=4, help="max FDs in SCM_RIGHTS CMSG block to handle")
+  parser.add_argument("-e", "--pageexponent", type=int, default=3, help="perf ring buffer size: 2^[pageexponent]")
+  parser.add_argument("-p", "--pids", nargs='+', default=[], help="trace only these pids")
+  parser.add_argument("-x", "--exclude", nargs='+', default=[], help="exclude these pids")
+  parser.add_argument("-P", "--pair", nargs='+', default=[], help="trace only this pid:pair")
+  parser.add_argument("-s", "--socket", type=str, help="trace only this unix socket path")
+  parser.add_argument("-b", "--beginswith", action='store_true', help="--socket will match starting sequences")
+  parser.add_argument("-@", "--base64", action='store_true', help="--socket will be parsed as base64 for binary paths (assumes abstract namespace)")
+  parser.add_argument("-c", "--color", action='store_true', help="output files with color")
+  cwd = check_output(['pwd'], shell=False).strip()
+  parser.add_argument("-o", "--dir", nargs='?',
+                      help="save output to files. defaults to $PWD", default=None, const=cwd)
+  parser.add_argument("-v", "--verbose", action='store_true', help="disables metadata elision")
+  parser.add_argument("-z", "--stats", action='store_true', help="debug stats output")
+  parser.add_argument("-d", "--debug", action='store_true', help="debug output")
+  parser.add_argument("-y", "--retry", type=int, default=5, help="number of retry attempts for incomplete events")
+  parser.add_argument("-l", "--ancillarydata", action='store_true', help="filter for ancillary data")
+  parser.add_argument("-E", "--preprocessonly", action='store_true', help="output bcc C code and exit")
+  parser.add_argument("-t", "--excludeownterminal", action='store_true', help="best effort to exclude terminal process from capture")
+  parser.add_argument("-B", "--extract", type=str, help="extract buffer from file output to binary files")
+
+  args = parser.parse_args()
+
+  if args.extract is not None:
+    if len(sys.argv) > 3:
+      parser.error("extract is mutually exclusive")
+      sys.exit(1)
+    extract_buffer(args.extract)
+    sys.exit(0)
+  if args.dir is not None and not os.path.isdir(args.dir):
+    parser.error("{} is not a directory.".format(args.dir))
+  if args.color and not args.dir:
+    parser.error("color requires file output")
+  if args.dir:
+    start_ts = int(time.time())
+  if len(args.pids) > 0:
+    try:
+      args.pids = [int(x) for x in args.pids]
+    except ValueError:
+      parser.error("invalid PID in --pids: {}".format(repr(args.pids)))
+
+    for pid in args.pids:
+      pid_map[pid] = check_output(['ps', '-q', str(pid), '-o', 'args='],
+                                 shell=False).strip()
+  if len(args.exclude) > 0:
+    try:
+      args.exclude = [int(x) for x in args.exclude]
+    except ValueError:
+      parser.error("invalid PID in --exclude: {}".format(repr(args.exclude)))
+  if len(args.pair) > 0:
+    if len(args.pids) > 0:
+      parser.error("--pids and --pair are mutually exclusive")
+    if len(args.exclude) > 0:
+      parser.error("--exclude and --pair are mutually exclusive")
+    if len(args.pair) > 1:
+      parser.error("--pair currently supports only one pair")
+    pairs = []
+    for pair in args.pair:
+      pieces = pair.split(':')
+      if len(pieces) != 2:
+        parser.error("invalid pair in --pair: {}".format(repr(pair)))
+      if not unicode.isdigit(pieces[0]) or not unicode.isdigit(pieces[1]):
+        parser.error("invalid pair in --pair: {}".format(repr(pair)))
+      pairs.append([int(pieces[0]), int(pieces[1])])
+    args.pairs = pairs
+
+    for pair in args.pairs:
+      pid_map[pair[0]] = check_output(['ps', '-q', str(pair[0]), '-o', 'args='],
+                                 shell=False).strip()
+      pid_map[pair[1]] = check_output(['ps', '-q', str(pair[1]), '-o', 'args='],
+                                 shell=False).strip()
+  else:
+    args.pairs = []
+
+  if args.beginswith and not args.socket:
+    parser.error("beginswith requires socket")
+
+  if args.color:
+    class bcolors:
+      # HEADER = '\033[95m'
+      BLUE = '\033[94m'
+      # GREEN = '\033[92m'
+      # YELLOW = '\033[93m'
+      RED = '\033[91m'
+      ENDC = '\033[0m'
+      # BOLD = '\033[1m'
+      # UNDERLINE = '\033[4m'
+
+  return args
+
 
 def gen_pid_in_list(name, lst):
   import pybst.avltree
@@ -180,101 +241,96 @@ def gen_ratchet_switch(sz):
   out += end
   return out
 
-def handle_ancillary_data(event, pid):
-  output_string = ''
-  had_event = False
-  id_map = {}
-  for scm in event.scm_data:
-    scm_type = int(scm.type) & 0xffff
-    if scm_type == 1: # SCM_RIGHTS
-      had_event = True
-      scm_fds = []
-      for i in range(int(scm.num)):
-        scm_fds.append(int(scm.content.rights.fds[i]))
-      output_string += "ancillary data (attempted to pass fds):\n" #.format(scm_fds))
-      for scm_fd in scm_fds:
-        proc_path = "/proc/{}/fd/{}".format(pid, scm_fd)
-        proc_link = None
-        if proc_path in fd_map:
-          proc_link = fd_map[proc_path]
-        else:
-          try:
-            fd_map[proc_path] = proc_link = os.readlink(proc_path)
-          except OSError:
-            proc_link = "(failed to read proc link)"
-        output_string += "  {} -> {}\n".format(proc_path, proc_link)
-    elif scm_type == 2: # SCM_CREDENTIALS
-      had_event = True
-      scm_pid = int(scm.content.creds.pid)
-      scm_uid = int(scm.content.creds.uid)
-      scm_gid = int(scm.content.creds.gid)
-      if scm_uid in id_map:
-        cred_ids = id_map[scm_uid]
+
+events_count = 0
+used_zero_count = 0
+used_zero_queue = []
+dropped_used_zero_count = 0
+no_slots_count = 0
+
+def main():
+  args = parse_args()
+
+  if args.excludeownterminal:
+    session = get_session_type()
+    tmux = is_in_tmux()
+    screen = is_in_screen()
+    if session == 'x11':
+      if tmux:
+        tpid = get_tmux_x11_current_terminal_pid()
+      elif screen:
+        tpid = get_screen_x11_current_terminal_pid()
       else:
-        cred_ids = check_output(['id', str(scm_uid)], shell=False).strip()
-        cred_ids = [c.split('=') for c in cred_ids.split(' ')]
-        id_map[scm_uid] = cred_ids
-
-      output_string += "ancillary data (attempted to send creds): "
-      output_string += "pid: {}, uid: {}, gid: {}\n".format(scm_pid, cred_ids[0][1],
-              cred_ids[1][1]
-           )
-
-      #print(cred_ids)
-
+        tpid = get_x11_current_terminal_pid()
+    elif session == 'wayland':
+      if tmux:
+        tpid = get_tmux_wayland_current_terminal_pid()
+      elif screen:
+        sys.stderr.write('screen on terminals on wayland is not currently supported.\n')
+        sys.exit(1)
+        #tpid = get_screen_wayland_current_terminal_pid()
+      else:
+        tpid = get_wayland_current_terminal_pid()
     else:
-      break
-  if had_event:
-    if event.scm_data[args.ancillarycount-1].type & 0xffff0000 != 0:
-      output_string += "ancillary event list truncated: true"
-    else:
-      output_string += "ancillary event list truncated: false"
-  return output_string
+      sys.stderr.write('XDG_SESSION_TYPE not supported\n')
+      sys.exit(1)
+    args.exclude.extend(tpid)
 
-RING_SIZE = args.ringsize
+  RING_SIZE = args.ringsize
+  PAGECNT = 2 ** args.pageexponent
 
-filter_pid = ""
-filter_unix = ""
-exclude_pids = ""
+  filter_pid = ""
+  filter_unix = ""
+  exclude_pids = ""
 
-defines = ""
+  defines = ""
 
-if args.pid is not None:
-  defines += "#define FILTER_PID %d\n" % args.pid
-if args.socket is not None:
-  sockkey = args.socket
-  if args.base64:
-    sockkey = '@' + ''.join(['\\x' + xx for xx in map(''.join, zip(*[iter(hexlify(b64decode(sockkey)).decode('utf-8'))]*2))])
-  defines += "#define FILTER_UNIX \"%s\"\n" % sockkey
+  if len(args.pids) == 1:
+    defines += "#define FILTER_PID %d\n" % args.pids[0]
+  if len(args.pairs) == 1:
+    defines += "#define FILTER_PAIR\n"
+    defines += "#define FILTER_PAIR_1 %d\n" % args.pairs[0][0]
+    defines += "#define FILTER_PAIR_2 %d\n" % args.pairs[0][1]
+  if args.socket is not None:
+    sockkey = args.socket
+    if args.base64:
+      sockkey = '@' + ''.join(['\\x' + xx for xx in map(''.join, zip(*[iter(hexlify(b64decode(sockkey)).decode('utf-8'))]*2))])
+    defines += "#define FILTER_UNIX \"%s\"\n" % sockkey
 
-if len(args.exclude) > 0:
-  defines += "#define EXCLUDE_PIDS\n"
-if args.beginswith:
-  defines += "#define BEGINS_WITH\n"
+  if len(args.pids) > 1:
+    defines += "#define INCLUDE_PIDS\n"
+  if len(args.exclude) > 0:
+    defines += "#define EXCLUDE_PIDS\n"
+  if args.beginswith:
+    defines += "#define BEGINS_WITH\n"
 
-if args.ancillarydata:
-  defines += "#define ANCILLARY\n"
+  if args.ancillarydata:
+    defines += "#define ANCILLARY\n"
 
-#if args.ancillarycount < 2:
-#  args.ancillarycount = 2
-defines += "#define ANCILLARY_COUNT ((size_t)%d)\n" % args.ancillarycount
-#if args.scmrightscount < 4:
-#  args.scmrightscount = 4
-defines += "#define SCM_RIGHTS_COUNT ((size_t)%d)\n" % args.scmrightscount
+  #if args.ancillarycount < 2:
+  #  args.ancillarycount = 2
+  defines += "#define ANCILLARY_COUNT ((size_t)%d)\n" % args.ancillarycount
+  #if args.scmrightscount < 4:
+  #  args.scmrightscount = 4
+  defines += "#define SCM_RIGHTS_COUNT ((size_t)%d)\n" % args.scmrightscount
 
-format_args = {
-  'defines': defines,
-  'error_defines': error_defines,
-  'RING_SIZE': RING_SIZE,
-  'ratchet_switch': gen_ratchet_switch(RING_SIZE),
-  'cores': multiprocessing.cpu_count(),
-  'is_excluded_pid': '',
-}
+  format_args = {
+    'defines': defines,
+    'error_defines': error_defines,
+    'RING_SIZE': RING_SIZE,
+    'ratchet_switch': gen_ratchet_switch(RING_SIZE),
+    'cores': multiprocessing.cpu_count(),
+    'is_included_pid': '',
+    'is_excluded_pid': '',
+  }
 
-if len(args.exclude) > 0:
-  format_args['is_excluded_pid'] = gen_pid_in_list("is_excluded_pid", args.exclude)
+  if len(args.pids) > 1:
+    format_args['is_included_pid'] = gen_pid_in_list("is_included_pid", args.pids)
 
-text = """
+  if len(args.exclude) > 0:
+    format_args['is_excluded_pid'] = gen_pid_in_list("is_excluded_pid", args.exclude)
+
+  text = """
 {{defines}}
 {{error_defines}}
 #include <bcc/proto.h>
@@ -449,6 +505,10 @@ static inline bool cmp_sun_path(char* str, size_t len) {
 }
 #endif
 
+#ifdef INCLUDE_PIDS
+{{is_included_pid}}
+#endif
+
 #ifdef EXCLUDE_PIDS
 {{is_excluded_pid}}
 #endif
@@ -585,6 +645,17 @@ int kprobe__unix_stream_sendmsg(struct pt_regs *ctx, struct socket *sock, struct
 
   #ifdef FILTER_PID
   if (n.pid != FILTER_PID && n.peer_pid != FILTER_PID) {
+    return 0;
+  }
+  #elif defined FILTER_PAIR
+  if (!(
+    (n.pid == FILTER_PAIR_1 && n.peer_pid == FILTER_PAIR_2) ||
+    (n.pid == FILTER_PAIR_2 && n.peer_pid == FILTER_PAIR_1)
+  )) {
+    return 0;
+  }
+  #elif defined INCLUDE_PIDS
+  if (!is_included_pid(n.pid) && !is_included_pid(n.peer_pid)) {
     return 0;
   }
   #endif
@@ -920,6 +991,10 @@ int kprobe__unix_dgram_sendmsg(struct pt_regs *ctx, struct socket *sock, struct 
   if (n.pid != FILTER_PID && n.peer_pid != FILTER_PID) {
     return 0;
   }
+  #elif defined INCLUDE_PIDS
+  if (!is_included_pid(n.pid) && !is_included_pid(n.peer_pid)) {
+    return 0;
+  }
   #endif
 
   #if defined(FILTER_UNIX) && !defined(BEGINS_WITH)
@@ -1090,7 +1165,7 @@ int kprobe__unix_dgram_sendmsg(struct pt_regs *ctx, struct socket *sock, struct 
       return 0;
     }
     #endif
-  
+
     //size_t _i = SIZE_MAX;
     #pragma unroll
     for (size_t i = 0; i < ANCILLARY_COUNT; i++) {
@@ -1255,371 +1330,405 @@ end:
 }
 
 """.replace(
-  "{", "{{"
-).replace(
-  "}", "}}"
-).replace(
-  "{{{{", "{"
-).replace(
-  "}}}}", "}"
-).format(**format_args)
+    "{", "{{"
+  ).replace(
+    "}", "}}"
+  ).replace(
+    "{{{{", "{"
+  ).replace(
+    "}}}}", "}"
+  ).format(**format_args)
 
-#UNIX_PATH_MAX = 108
+  if args.preprocessonly:
+    print(text)
+    sys.exit(0)
 
-class scm_rights(ctypes.Structure):
-  _fields_ = [
-    ("fds", ctypes.c_int*args.scmrightscount),
-  ]
+  #UNIX_PATH_MAX = 108
 
-class scm_credentials(ctypes.Structure):
-  _fields_ = [
-    ("pid", ctypes.c_uint32),
-    ("uid", ctypes.c_uint32),
-    ("gid", ctypes.c_uint32),
-    ("pad", ctypes.c_uint32),
-  ]
+  class scm_rights(ctypes.Structure):
+    _fields_ = [
+      ("fds", ctypes.c_int*args.scmrightscount),
+    ]
 
-class scm_content(ctypes.Union):
-  _fields_ = [
-    ("rights", scm_rights),
-    ("creds", scm_credentials),
-  ]
+  class scm_credentials(ctypes.Structure):
+    _fields_ = [
+      ("pid", ctypes.c_uint32),
+      ("uid", ctypes.c_uint32),
+      ("gid", ctypes.c_uint32),
+      ("pad", ctypes.c_uint32),
+    ]
 
-class scm_data(ctypes.Structure):
-  _fields_ = [
-    ("type", ctypes.c_uint32),
-    ("num", ctypes.c_uint32),
-    ("content", scm_content),
-  ]
+  class scm_content(ctypes.Union):
+    _fields_ = [
+      ("rights", scm_rights),
+      ("creds", scm_credentials),
+    ]
 
-class notify_t(ctypes.Structure):
-  _fields_ = [
-    ("cpu", ctypes.c_uint16),
-    ("type", ctypes.c_uint16),
-    ("index", ctypes.c_uint32),
-    ("sk_file", ctypes.c_size_t),
-    ("peer_file", ctypes.c_size_t),
-    ("pid", ctypes.c_uint32),
-    ("peer_pid", ctypes.c_uint32),
-    ("is_bound", ctypes.c_uint8),
-    ("is_truncated", ctypes.c_uint8),
-    ("sun_path_len", ctypes.c_uint8),
-    ("error_code", ctypes.c_uint8),
-    ("len", ctypes.c_uint32),
-    ("error_msg", ctypes.c_size_t),
-    ("scm_data", scm_data*args.ancillarycount),
-    ("sun_path", ctypes.c_size_t*14),
-  ]
+  class scm_data(ctypes.Structure):
+    _fields_ = [
+      ("type", ctypes.c_uint32),
+      ("num", ctypes.c_uint32),
+      ("content", scm_content),
+    ]
 
-pid_map = {}
-fd_map = {}
-pid_pair_map = {}
+  class notify_t(ctypes.Structure):
+    _fields_ = [
+      ("cpu", ctypes.c_uint16),
+      ("type", ctypes.c_uint16),
+      ("index", ctypes.c_uint32),
+      ("sk_file", ctypes.c_size_t),
+      ("peer_file", ctypes.c_size_t),
+      ("pid", ctypes.c_uint32),
+      ("peer_pid", ctypes.c_uint32),
+      ("is_bound", ctypes.c_uint8),
+      ("is_truncated", ctypes.c_uint8),
+      ("sun_path_len", ctypes.c_uint8),
+      ("error_code", ctypes.c_uint8),
+      ("len", ctypes.c_uint32),
+      ("error_msg", ctypes.c_size_t),
+      ("scm_data", scm_data*args.ancillarycount),
+      ("sun_path", ctypes.c_size_t*14),
+    ]
 
-events_count = 0
-used_zero_count = 0
-used_zero_queue = []
-dropped_used_zero_count = 0
-no_slots_count = 0
+  # TODO: convert to inline python 3 f-strings
+  #       consider converting to % format string for performance in python 2
+  sun_path_template = '''\
+sun_path: {!r}, length {}
+'''
+  printed_template = '''\
+{} PID {}.0x{:x} ({}) > {}.0x{:x} ({}), length {}{}
+'''
+  written_template = '''\
+{} PID {}.0x{:x} ({}) > {}.0x{:x} ({})
+'''
+  command_template = '''\
+command[{}]: {!r}
+'''
+  def format_printed_metadata(args, sun_path, ts, sock_type, is_bound,
+                              pid, sk_file, command,
+                              peer_pid, peer_file, peer_command,
+                              data_len, data_is_truncated):
+    out_str = ''
+    if args.socket is not None and args.verbose:
+      # should have already been set
+      out_str += sun_path_template.format(sun_path, len(sun_path))
+    elif args.socket is None:
+      out_str += sun_path_template.format(sun_path, len(sun_path))
 
-def dump_stats():
-  if not args.stats:
-    return
-  sys.stderr.write("\n\n")
-  sys.stderr.write("events_count: {}\n".format(events_count))
-  sys.stderr.write("used_zero_count: {}\n".format(used_zero_count))
-  sys.stderr.write("used_zero_queue: {}\n".format(used_zero_queue))
-  sys.stderr.write("dropped_used_zero_count: {}\n".format(dropped_used_zero_count))
-  sys.stderr.write("no_slots_count: {}\n".format(no_slots_count))
+    sock_type_str = { 1: 'STREAM', 2: 'DGRAM' }[sock_type]
+    role = "S" if is_bound else "C"
+    peer_role = "S" if not is_bound else "C"
+    data_truncated_str = " (truncated)" if data_is_truncated else ""
 
-  sys.stderr.write("\n")
+    out_str += printed_template.format(
+                sock_type_str, pid, sk_file, role,
+                peer_pid, peer_file, peer_role, data_len, data_truncated_str)
 
+    pid_str = str(pid)
+    peer_pid_str = str(peer_pid)
+    m = max(len(pid_str), len(peer_pid_str))
 
-def print_event(cpu, data, size, rec=0):
-  global events_count
-  global used_zero_count
-  global used_zero_queue
-  global dropped_used_zero_count
-  global no_slots_count
+    if args.verbose or (
+        (len(args.pids) != 1 or args.pids[0] != pid)
+        and len(args.pairs) != 1
+      ):
+      out_str += command_template.format(pid_str.rjust(m), command)
+    if args.verbose or (
+        (len(args.pids) != 1 or args.pids[0] != peer_pid)
+        and len(args.pairs) != 1
+      ):
+      out_str += command_template.format(peer_pid_str.rjust(m), peer_command)
+    return out_str
 
-  if rec > args.retry:
-    dropped_used_zero_count += 1
-    return -1
+  def format_written_metadata(sun_path, sock_type, is_bound,
+                              pid, sk_file, command,
+                              peer_pid, peer_file, peer_command):
+    out_str = ''
+    out_str += sun_path_template.format(sun_path, len(sun_path))
 
-  # will likely cause events to print out of order
-  # todo: add metadata to buffer_t to confirm it matches the retried event
-  if not args.dir:
-    if len(used_zero_queue) > 0:
-      copy_queue = used_zero_queue
-      used_zero_queue = []
-      for event in copy_queue:
-        events_count -= 1
-        #used_zero_count -= 1
-        r = print_event(*event)
-        if r == None:
-          used_zero_count -= 1
+    sock_type_str = { 1: 'STREAM', 2: 'DGRAM' }[sock_type]
+    role = "S" if is_bound else "C"
+    peer_role = "S" if not is_bound else "C"
 
-  events_count += 1
-  try:
-    if not args.dir: print("====")
-    event = ctypes.cast(data, ctypes.POINTER(notify_t)).contents
-    if int(event.type) not in [1, 2]:
-      sys.stderr.write("INVALID event.type: " + str(int(event.type)) + "\n")
+    out_str += written_template.format(
+                sock_type_str, pid, sk_file, role,
+                peer_pid, peer_file, peer_role)
+
+    pid_str = str(pid)
+    peer_pid_str = str(peer_pid)
+    m = max(len(pid_str), len(peer_pid_str))
+
+    out_str += command_template.format(pid_str.rjust(m), command)
+    out_str += command_template.format(peer_pid_str.rjust(m), peer_command)
+
+    return out_str
+
+  def dump_stats():
+    if not args.stats:
       return
+    sys.stderr.write("\n\n")
+    sys.stderr.write("events_count: {}\n".format(events_count))
+    sys.stderr.write("used_zero_count: {}\n".format(used_zero_count))
+    sys.stderr.write("used_zero_queue: {}\n".format(used_zero_queue))
+    sys.stderr.write("dropped_used_zero_count: {}\n".format(dropped_used_zero_count))
+    sys.stderr.write("no_slots_count: {}\n".format(no_slots_count))
 
-    typ = { 1: 'SOCK_STREAM', 2: 'SOCK_DGRAM' }[int(event.type)]
-    idx = int(event.index)
-    if args.debug:
-      print("cpu: " + str(cpu) + ":" + str(event.cpu))
-      print("idx: " + str(idx))
+    sys.stderr.write("\n")
 
-    pid = event.pid
-    peer_pid = event.peer_pid
-    if not args.pid:
-      command = None
-      if pid in pid_map:
-        command = pid_map[pid]
-      else:
-        try:
-          proc = check_output(['ps', '-q', str(pid), '-o', 'args='],
-                              shell=False).strip()
-        except CalledProcessError as ex:
-          #print("ERROR: check_output non-zero exit status")
-          proc = '(already terminated)'
+  ancillary_preamble_template = 'ancillary data sent (attempted): {} CMSG{} observed{}\n'
+  scm_creds_template    = '  SCM_CREDENTIALS: pid={} uid={} gid={}\n'
+  scm_rights_header     = '  SCM_RIGHTS: '
+  scm_rights_template_a = 'FD {}, {}\n'
+  scm_rights_template_b = '              FD {}, {}\n'
+  scm_rights_template_c = '(truncated)\n'
+  scm_rights_template_d = '              (truncated)\n'
+  def handle_ancillary_data(event, pid):
+    out_str = ''
+    id_map = {}
+    cmsg_count = 0
 
-        pid_map[pid] = proc
-        command = proc
-
-    peer_command = None
-    if peer_pid in pid_map:
-      peer_command = pid_map[peer_pid]
-    else:
-      try:
-        if peer_pid < 32768:
-          proc = check_output(['ps', '-q', str(peer_pid), '-o', 'args='],
-                              shell=False).strip()
+    had_scm_rights_header = False
+    for scm in event.scm_data:
+      scm_type = int(scm.type) & 0xffff
+      if scm_type == 0:
+        break
+      elif scm_type == 1: # SCM_RIGHTS
+        cmsg_count += 1
+        out_str += '  SCM_RIGHTS: '
+        scm_fds = []
+        num = int(scm.num)
+        fd_cap = len(scm.content.rights.fds)
+        fd_trunc = False
+        if num > fd_cap:
+          fd_trunc = True
+        for i in range(min(num, fd_cap)):
+          scm_fds.append(int(scm.content.rights.fds[i]))
+        for scm_fd in scm_fds:
+          proc_path = "/proc/{}/fd/{}".format(pid, scm_fd)
+          proc_link = None
+          if proc_path in fd_map:
+            proc_link = fd_map[proc_path]
+          else:
+            try:
+              fd_map[proc_path] = proc_link = repr(os.readlink(proc_path))[1:]
+            except OSError:
+              proc_link = "(failed to read proc link)"
+          if not had_scm_rights_header:
+            out_str += scm_rights_template_a.format(scm_fd, proc_link)
+            had_scm_rights_header = True
+          else:
+            out_str += scm_rights_template_b.format(scm_fd, proc_link)
+        if fd_trunc:
+          if not had_scm_rights_header:
+            out_str += scm_rights_template_c
+          else:
+            out_str += scm_rights_template_d
+        had_scm_rights_header = False
+      elif scm_type == 2: # SCM_CREDENTIALS
+        cmsg_count += 1
+        scm_pid = int(scm.content.creds.pid)
+        scm_uid = int(scm.content.creds.uid)
+        scm_gid = int(scm.content.creds.gid)
+        if scm_uid in id_map:
+          cred_ids = id_map[scm_uid]
         else:
-          proc = '(peer_pid error)'
-      except CalledProcessError as ex:
-        print("ERROR: check_output non-zero exit status")
-      pid_map[peer_pid] = proc
-      peer_command = proc
+          cred_ids = check_output(['id', str(scm_uid)], shell=False).strip()
+          cred_ids = [c.split('=') for c in cred_ids.split(' ')]
+          id_map[scm_uid] = cred_ids
 
-    error_code = int(event.error_code)
-    if error_code != 0:
-      if args.pid is not None and int(args.pid) == pid:
-        command = start_command
-      elif pid in pid_map:
-        command = pid_map[pid]
+        out_str += scm_creds_template.format(
+                     scm_pid, cred_ids[0][1], cred_ids[1][1]
+                   )
       else:
-        command = 'UNKNOWN'
-      if not args.dir: print("error!")
-      if not args.dir: print("pid: " + str(pid))
-      if not args.dir: print("command: " + command)
-      if not args.dir: print("peer_pid: " + str(peer_pid))
-      if not args.dir: print("sk_file: 0x{:x}".format(event.sk_file))
-      if not args.dir: print("peer_file: 0x{:x}".format(event.peer_file))
-      if not args.dir: print("peer_command: " + peer_command)
-      if args.socket is None or args.beginswith:
-        sun_path_len = event.sun_path_len
-        if not args.dir: print("sun_path_len: {}".format(sun_path_len))
-        sun_path = ctypes.string_at(event.sun_path, sun_path_len)
-        if not args.dir: print("sun_path: {}".format(repr(sun_path)))
-      if not args.dir: print("error: {}".format(errors_rev[error_code]))
-      if not args.dir: print("error_msg: {:x}".format(int(event.error_msg)))
-      if error_code == errors['NO_SLOTS_AVAILABLE']:
-        no_slots_count += 1
-        #del py_ring[int(event.error_msg)]
-        py_ring.clearitem(int(event.error_msg))
-      if args.dir:
-        # error log writing
-        error_filename = 'udss_error.log'
-        file_directory = args.dir
-        current_file = os.path.join(file_directory, error_filename)
-        if os.path.exists(current_file):
-          with open(str(current_file), 'a') as e:
-            e.write("pid: {}\n".format(str(pid)))
-            e.write("command: {}\n".format(command))
-            e.write("peer_pid: {}\n".format(str(peer_pid)))
-            e.write("sk_file: 0x{:x}\n".format(event.sk_file))
-            e.write("peer_file: 0x{:x}\n".format(event.peer_file))
-            e.write("peer_comand: {}\n".format(peer_command))
-            if args.socket is None or args.beginswith:
-              e.write("sun_path_len: {}\n".format(sun_path_len))
-              e.write("sun_path: {}\n".format(repr(sun_path)))
-            e.write("error: {}\n".format(errors_rev[error_code]))
-            e.write("error_msg: {:x}\n".format(int(event.error_msg)))
-            e.write('========\n')
-        else:
-          with open(str(current_file), 'w') as e:
-            e.write("pid: {}\n".format(str(pid)))
-            e.write("command: {}\n".format(command))
-            e.write("peer_pid: {}\n".format(str(peer_pid)))
-            e.write("sk_file: 0x{:x}\n".format(event.sk_file))
-            e.write("peer_file: 0x{:x}\n".format(event.peer_file))
-            e.write("peer_comand: {}\n".format(peer_command))
-            if args.socket is None or args.beginswith:
-              e.write("sun_path_len: {}\n".format(sun_path_len))
-              e.write("sun_path: {}\n".format(repr(sun_path)))
-            e.write("error: {}\n".format(errors_rev[error_code]))
-            e.write("error_msg: {:x}\n".format(int(event.error_msg)))
-            e.write('========\n')
+        out_str += '  INVALID CMSG of type: 0x{:x}\n'.format(scm_type)
 
-      return
+    if cmsg_count > 0:
+      plural = '' if cmsg_count == 1 else "s"
+      trunc = ''
+      if event.scm_data[args.ancillarycount-1].type & 0xffff0000 != 0:
+        trunc = ' (truncated)'
+      return ancillary_preamble_template.format(cmsg_count, plural, trunc) + out_str
+    return ''
 
 
-    entry = py_ring[idx][cpu]
-    #entry = py_ring[idx]
+  def print_event(cpu, data, size, rec=0):
+    global events_count
+    global used_zero_count
+    global used_zero_queue
+    global dropped_used_zero_count
+    global no_slots_count
 
-    if args.debug:
-      if not args.dir: print("used: {}".format(entry.used))
+    if rec > args.retry:
+      dropped_used_zero_count += 1
+      return -1
 
-    if entry.used == 0:
-      if rec == 0:
-        used_zero_count += 1
-      if args.dir:
-        r = print_event(cpu, data, size, rec+1) # can lock up w/ overly recursive calls
-        if rec == 0 and r == None:
-          used_zero_count -= 1
-        else:
-          if not args.dir: print("used: 0")
-          return r
-      else:
-        #used_zero_queue.insert(0, [cpu, data, size]) # from old insert/pop impl
-        used_zero_queue.append([cpu, data, size, rec+1])
-        return -1
-      #while entry.used == 0:
-      #  #del py_ring[idx]
-      #  time.sleep(0.1)
-      #  #entry = py_ring[idx][cpu]
-      #  entry = py_ring[idx]
-      #SIZETPTR = ctypes.POINTER(ctypes.c_size_t)
-      #while True:
-      #  time.sleep(0.001)
-      #  entry = py_ring[idx][cpu]
-      #  addr = ctypes.addressof(entry)
-      #  used = ctypes.cast(addr, SIZETPTR)[0]
-      #  if used:
-      #    break
-      #  #print("not used?")
-      #del py_ring[idx]
-      #py_ring.clearitem(idx)
-      #return
-
-    #while entry.used == 0:
-    #  time.sleep(0.02)
-    #  #try:
-    #  #  os.close(-1)
-    #  #except OSError:
-    #  #  pass
-    #  entry = py_ring[idx][cpu]
-
-    #todo: add type to file output
-    if not args.dir: print("type: " + typ)
-    if args.pid is None:
-      if not args.dir: print("pid: " + str(pid))
-      if not args.dir: print("command: " + command)
-    is_bound = event.is_bound
-    peer_role = "server" if is_bound else "client"
-    if not args.dir: print("role: " + peer_role)
-    if not args.dir: print("peer_pid: " + str(peer_pid))
-    if not args.dir: print("sk_file: 0x{:x}".format(event.sk_file))
-    if not args.dir: print("peer_file: 0x{:x}".format(event.peer_file))
-    if not args.dir: print("peer_command: " + peer_command)
-    if not args.dir: print("len: {}".format(event.len))
-
-    if args.socket is None or args.beginswith:
-      sun_path_len = event.sun_path_len
-      if not args.dir: print("sun_path_len: {}".format(sun_path_len))
-      sun_path = ctypes.string_at(event.sun_path, sun_path_len)
-      if not args.dir: print("sun_path: {}".format(repr(sun_path)))
-
+    # will likely cause events to print out of order
+    # todo: add metadata to buffer_t to confirm it matches the retried event
     if not args.dir:
-      ancillary_result = handle_ancillary_data(event, pid)
-      if ancillary_result:
-        print(ancillary_result)
-     # had_event = False
-     # id_map = {}
-     # for scm in event.scm_data:
-     #   scm_type = int(scm.type) & 0xffff
-     #   if scm_type == 1: # SCM_RIGHTS
-     #     had_event = True
-     #     scm_fds = []
-     #     for i in range(int(scm.num)):
-     #       scm_fds.append(int(scm.content.rights.fds[i]))
-     #     print("ancillary data (attempted to pass fds):") #.format(scm_fds))
-     #     for scm_fd in scm_fds:
-     #       proc_path = "/proc/{}/fd/{}".format(pid, scm_fd)
-     #       proc_link = None
-     #       if proc_path in fd_map:
-     #         proc_link = fd_map[proc_path]
-     #       else:
-     #         try:
-     #           fd_map[proc_path] = proc_link = os.readlink(proc_path)
-     #         except OSError:
-     #           proc_link = "(failed to read proc link)"
-     #       print("  {} -> {}".format(proc_path, proc_link))
-     #   elif scm_type == 2: # SCM_CREDENTIALS
-     #     had_event = True
-     #     scm_pid = int(scm.content.creds.pid)
-     #     scm_uid = int(scm.content.creds.uid)
-     #     scm_gid = int(scm.content.creds.gid)
-     #     if scm_uid in id_map:
-     #       cred_ids = id_map[scm_uid]
-     #     else:
-     #       cred_ids = check_output(['id', str(scm_uid)], shell=False).strip()
-     #       cred_ids = [c.split('=') for c in cred_ids.split(' ')]
-     #       id_map[scm_uid] = cred_ids
+      if len(used_zero_queue) > 0:
+        copy_queue = used_zero_queue
+        used_zero_queue = []
+        for event in copy_queue:
+          events_count -= 1
+          #used_zero_count -= 1
+          r = print_event(*event)
+          if r == None:
+            used_zero_count -= 1
 
-     #     print("ancillary data (attempted to send creds): " +
-     #           "pid: {}, uid: {}, gid: {}".format(
-     #             scm_pid, cred_ids[0][1], cred_ids[1][1]
-     #          )
-     #     )
+    events_count += 1
+    try:
+      event = ctypes.cast(data, ctypes.POINTER(notify_t)).contents
+      sock_type = int(event.type)
+      if sock_type not in [1, 2]:
+        if not args.dir: print("====")
+        sys.stderr.write("INVALID event.type: " + str(sock_type) + "\n")
+        return
 
-     #     #print(cred_ids)
-
-     #   else:
-     #     break
-     # if had_event:
-     #   if event.scm_data[args.ancillarycount-1].type & 0xffff0000 != 0:
-     #     print("ancillary event list truncated: true")
-     #   else:
-     #     print("ancillary event list truncated: false")
-
-
-    buffer = ctypes.string_at(entry.buffer, int(event.len))
-    if event.is_truncated:
-      if not args.dir: print("event truncated: true")
-    if not args.dir: print("----")
-    if not args.dir: hexdump.hexdump(buffer)
-
-    if args.dir:
-      current_filename = None
-      file_directory = args.dir
       if args.socket is None or args.beginswith:
-        sun_path_len = event.sun_path_len
-        sun_path = ctypes.string_at(event.sun_path, sun_path_len)
+        sun_path = ctypes.string_at(event.sun_path, event.sun_path_len)
       else:
         sun_path = args.socket
-      if args.pid:
-        command = start_command
 
-      pair_key = "{}-{}-{}-{}".format(str(pid), str(peer_pid),'0x{:x}'.format(event.sk_file),
-            '0x{:x}'.format(event.peer_file))
-      if pair_key in pid_pair_map:
-        current_filename = pid_pair_map[pair_key]['fn']
+      # ideally, by the time we have ts, we'll also be using pcapng
+      # so we won't have to worry about writing metadata only once to disk
+      ts = 0
+      is_bound = event.is_bound
+
+      peer_role = "server" if is_bound else "client"
+
+      typ = { 1: 'SOCK_STREAM', 2: 'SOCK_DGRAM' }[sock_type]
+      idx = int(event.index)
+      if args.debug and rec == 0:
+        print("cpu: " + str(cpu) + ":" + str(event.cpu))
+        print("idx: " + str(idx))
+
+      pid = event.pid
+      command = "(unknown)"
+      if args.verbose or (len(args.pids) != 1 or args.pids[0] != pid):
+        if pid in pid_map:
+          command = pid_map[pid]
+        else:
+          try:
+            proc = check_output(['ps', '-q', str(pid), '-o', 'args='],
+                                shell=False, stderr=-2).strip()
+          except CalledProcessError as ex:
+            proc = str('(already terminated)')
+
+          pid_map[pid] = proc
+          command = proc
+
+      peer_pid = event.peer_pid
+      peer_command = "(unknown)"
+      if args.verbose or (len(args.pids) != 1 or args.pids[0] != peer_pid):
+        if peer_pid in pid_map:
+          peer_command = pid_map[peer_pid]
+        else:
+          try:
+            proc = check_output(['ps', '-q', str(peer_pid), '-o', 'args='],
+                                shell=False, stderr=-2).strip()
+          except CalledProcessError as ex:
+            proc = str('(already terminated)')
+          pid_map[peer_pid] = proc
+          peer_command = proc
+
+      error_code = int(event.error_code)
+      if error_code != 0:
+        metadata = format_printed_metadata(
+                     args, sun_path, ts, sock_type, is_bound,
+                     pid, event.sk_file, command,
+                     peer_pid, event.peer_file, peer_command,
+                     int(event.len), event.is_truncated)
+
+        if not args.dir:
+          sys.stdout.write("====\nerror!\n")
+          sys.stdout.write(metadata)
+          sys.stdout.write("error: {}\n".format(errors_rev[error_code]))
+          sys.stdout.write("error_msg: 0x{:x}\n".format(int(event.error_msg)))
+        else:
+          # error log writing
+          error_filename = 'unixdump_error.log'
+          file_directory = args.dir
+          current_file = os.path.join(file_directory, error_filename)
+          mode = 'a' if os.path.exists(current_file) else 'w'
+          with open(str(current_file), mode) as e:
+            e.write('====\n')
+            e.write(metadata)
+            e.write("error: {}\n".format(errors_rev[error_code]))
+            e.write("error_msg: 0x{:x}\n".format(int(event.error_msg)))
+        if error_code == errors['NO_SLOTS_AVAILABLE']:
+          no_slots_count += 1
+          py_ring.clearitem(int(event.error_msg))
+
+        return
+
+      entry = py_ring[idx][cpu]
+
+      # need to somehow fit this appropriately
+      if args.debug and rec == 0:
+        print("used: {}".format(entry.used))
+
+      if entry.used == 0:
+        if rec == 0:
+          used_zero_count += 1
+        if args.dir:
+          r = print_event(cpu, data, size, rec+1) # can lock up w/ overly recursive calls
+          if rec == 0 and r == None:
+            used_zero_count -= 1
+          else:
+            if not args.dir: print("used: 0")
+            return r
+        else:
+          used_zero_queue.append([cpu, data, size, rec+1])
+          return -1
+
+      buffer = ctypes.string_at(entry.buffer, int(event.len))
+
+      if not args.dir:
+        sys.stdout.write("====\n")
+        sys.stdout.write(
+          format_printed_metadata(args, sun_path, ts, sock_type, is_bound,
+                                  pid, event.sk_file, command,
+                                  peer_pid, event.peer_file, peer_command,
+                                  int(event.len), event.is_truncated)
+        )
+        ancillary_result = handle_ancillary_data(event, pid)
+        if ancillary_result:
+          print(ancillary_result)
+
+        #todo: add type to file output
+        #if not args.dir: print("type: " + typ)
+
+        print("----")
+        hexdump.hexdump(buffer)
       else:
-        rev_pkey = "{}-{}-{}-{}".format(str(peer_pid), str(pid),'0x{:x}'.format(event.peer_file),
-            '0x{:x}'.format(event.sk_file))
-        pair_obj = { 'fn': '{}-{}'.format(pair_key, 
-            repr(sun_path).replace('/','_'))}
-        pid_pair_map[pair_key] = pair_obj
-        pid_pair_map[rev_pkey] = pair_obj
-        current_filename = pid_pair_map[pair_key]['fn']
+        # dir/file name setup
+        current_filename = None
+        file_directory = args.dir
 
-      current_file = os.path.join(file_directory, current_filename)
-      if os.path.exists(current_file):
-        with open(str(current_file), 'a') as f:
+        pair_key = "{}-{}-{}-{}".format(str(pid), str(peer_pid),'0x{:x}'.format(event.sk_file),
+              '0x{:x}'.format(event.peer_file))
+        if pair_key in pid_pair_map:
+          current_filename = pid_pair_map[pair_key]['fn']
+        else:
+          rev_pkey = "{}-{}-{}-{}".format(str(peer_pid), str(pid),'0x{:x}'.format(event.peer_file),
+              '0x{:x}'.format(event.sk_file))
+          pair_obj = { 'fn': '{}-{}'.format(pair_key,
+              repr(sun_path).replace('/','_'))}
+          pid_pair_map[pair_key] = pair_obj
+          pid_pair_map[rev_pkey] = pair_obj
+          current_filename = pid_pair_map[pair_key]['fn']
+
+        current_file = os.path.join(file_directory, current_filename)
+        mode = 'a' if os.path.exists(current_file) else 'w'
+        with open(str(current_file), mode) as f:
+          if mode == 'w':
+            if args.verbose:
+              print("writing to {} for: {}".format(current_filename, command))
+            f.write(
+              format_written_metadata(sun_path, sock_type, is_bound,
+                                      pid, event.sk_file, command,
+                                      peer_pid, event.peer_file, peer_command)
+            )
           if is_bound:
             f.write("{} -> {}{}\n< ".format(str(pid),str(peer_pid),bcolors.BLUE))
             f.write(hexdump.hexdump(buffer, result='return').replace('\n','\n< '))
@@ -1631,53 +1740,31 @@ def print_event(cpu, data, size, rec=0):
             f.write("\n")
             f.write(handle_ancillary_data(event, pid))
           f.write('\n{}========\n'.format(bcolors.ENDC))
-      else:
-        print("{} for: {}...".format(current_filename, command))
-        with open(str(current_file), 'w') as f:
-          f.write(sun_path + '\n')
-          f.write(str(pid) + '\n')
-          f.write(command + '\n')
-          f.write(peer_role + '\n')
-          f.write('0x{:x}'.format(event.sk_file) + '\n')
-          f.write('0x{:x}'.format(event.peer_file) + '\n')
-          if is_bound:
-            f.write("{} -> {}{}\n< ".format(str(pid),str(peer_pid),bcolors.BLUE))
-            f.write(hexdump.hexdump(buffer, result='return').replace('\n','\n< '))
-            f.write("\n")
-            f.write(handle_ancillary_data(event, pid))
-          else:
-            f.write("{} -> {}{}\n> ".format(str(pid),str(peer_pid),bcolors.RED))
-            f.write(hexdump.hexdump(buffer, result='return').replace('\n','\n> '))
-            f.write("\n")
-            f.write(handle_ancillary_data(event, pid))
-          f.write('\n{}========\n'.format(bcolors.ENDC))
-    #sys.stderr.write("{}\n".format(type(py_ring)))
-    #sys.stderr.write("{}\n".format(py_ring.max_entries))
-    #sys.stderr.write("{}\n".format(type(py_ring[idx])))
-    #sys.stderr.write("{}\n".format(type(py_ring[idx][cpu])))
-    #py_ring[idx].__delitem__(cpu)
-    #del py_ring[idx]
-    py_ring.clearitem(idx)
+      py_ring.clearitem(idx)
 
-  except KeyboardInterrupt:
-    dump_stats()
-    sys.exit(0)
+    except KeyboardInterrupt:
+      dump_stats()
+      sys.exit(0)
 
-#b = BPF(text=text).trace_print()
-#b = BPF(text=text, debug=0x8)
-b = BPF(text=text)
+  #b = BPF(text=text).trace_print()
+  #b = BPF(text=text, debug=0x8)
+  b = BPF(text=text)
 
-py_ring = b["ring_buf"]
-b["output"].open_perf_buffer(print_event)
+  py_ring = b["ring_buf"]
+  b["output"].open_perf_buffer(print_event, page_cnt=PAGECNT)
 
-#b.trace_print()
+  #b.trace_print()
 
-print("Listening...")
-while True:
-  try:
-    b.kprobe_poll()
-  except KeyboardInterrupt:
-    dump_stats()
-    sys.exit(0)
+  print("Listening...")
+  while True:
+    try:
+      b.kprobe_poll()
+    except KeyboardInterrupt:
+      dump_stats()
+      sys.exit(0)
 
+if __name__ == '__main__':
+  main()
+
+__all__ = ["parse_args", "main"]
 
