@@ -22,7 +22,7 @@ $ sudo apt-get install build-essential clang llvm git libelf-dev xxd
 ## Usage
 
 ```bash
-$ git submodule update # pulls in libbpf/
+$ git submodule update --init # pulls in libbpf/
 $ make
 $ file conjob
 conjob: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, for GNU/Linux 3.2.0, BuildID[sha1]=fbefdcf7c3c9263cf6fa7d132304e2593787baa8, stripped
