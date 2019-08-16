@@ -12,9 +12,17 @@ sysfs (`/sys/**`) and is therefore not blocked by Docker's AppArmor profile.
 Additionally, `common/bpf_load.{c,h}` are sourced from
 [`linux/samples/bpf`](https://github.com/torvalds/linux/tree/master/samples/bpf).
 
+## Dependencies
+
+```bash
+# on Ubuntu 18.04
+$ sudo apt-get install build-essential clang llvm git libelf-dev xxd
+```
+
 ## Usage
 
 ```bash
+$ git submodule update # pulls in libbpf/
 $ make
 $ file conjob
 conjob: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, for GNU/Linux 3.2.0, BuildID[sha1]=fbefdcf7c3c9263cf6fa7d132304e2593787baa8, stripped
