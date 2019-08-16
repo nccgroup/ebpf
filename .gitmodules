@@ -1,0 +1,3 @@
+[submodule "obie-trice-conjob/libbpf"]
+	path = obie-trice-conjob/libbpf
+	url = https://github.com/libbpf/libbpf
