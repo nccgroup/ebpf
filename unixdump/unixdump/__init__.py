@@ -524,7 +524,9 @@ inline static void copy_into_entry_buffer(data_t* entry, size_t const len, char*
   if (l >= BUFFER_SIZE) {
     l = BUFFER_SIZE - 1;
   }
-  bpf_probe_read(entry->buffer, l, base);
+  if (l < BUFFER_SIZE) {
+    bpf_probe_read(entry->buffer, l, base);
+  }
 }
 
 static inline struct cmsghdr* cmsg_firsthdr_x(struct msghdr* msg) {
@@ -595,6 +597,7 @@ static inline int process_cmsg(struct cmsghdr* real_cmsg,
 
 int kprobe__unix_stream_sendmsg(struct pt_regs *ctx, struct socket *sock, struct msghdr *msg){
   struct notify_t n;
+  __builtin_memset(&n, 0, sizeof(n));
   n.cpu = bpf_get_smp_processor_id();
   n.type = SOCK_STREAM;
 
@@ -920,6 +923,7 @@ end:
 
 int kprobe__unix_dgram_sendmsg(struct pt_regs *ctx, struct socket *sock, struct msghdr *msg){
   struct notify_t n;
+  __builtin_memset(&n, 0, sizeof(n));
   n.cpu = bpf_get_smp_processor_id();
   n.type = SOCK_DGRAM;
 
