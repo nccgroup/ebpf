@@ -524,7 +524,9 @@ inline static void copy_into_entry_buffer(data_t* entry, size_t const len, char*
   if (l >= BUFFER_SIZE) {
     l = BUFFER_SIZE - 1;
   }
-  bpf_probe_read(entry->buffer, l, base);
+  if (l < BUFFER_SIZE) {
+    bpf_probe_read(entry->buffer, l, base);
+  }
 }
 
 static inline struct cmsghdr* cmsg_firsthdr_x(struct msghdr* msg) {
