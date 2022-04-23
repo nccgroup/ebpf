@@ -27,6 +27,7 @@ from binascii import hexlify
 
 from subprocess import check_output, CalledProcessError
 import os
+import select
 import multiprocessing
 
 
@@ -40,11 +41,12 @@ errors = {
   'SIGNED_LEN_NEGATIVE': 7,
   'NO_SLOTS_AVAILABLE': 8,
   'CMSG_NOT_OK': 9,
-  'CMSG_WRONG_TYPE': 10,
-  'CMSG_BAD_LEN': 11,
-  'CMSG_CRED_ZERO_PID': 12,
-  'SK_PEER_NULL' : 13,
-  'SK_NULL' : 14,
+  'CMSG_BAD': 10,
+  'CMSG_WRONG_TYPE': 11,
+  'CMSG_BAD_LEN': 12,
+  'CMSG_CRED_ZERO_PID': 13,
+  'SK_PEER_NULL' : 14,
+  'SK_NULL' : 15,
 }
 errors_rev = {v: k for k, v in errors.items()}
 
@@ -241,12 +243,29 @@ def gen_ratchet_switch(sz):
   out += end
   return out
 
+def render_code(template, format_args):
+  return template.replace(
+    "{", "{{"
+  ).replace(
+    "}", "}}"
+  ).replace(
+    "{{{{", "{"
+  ).replace(
+    "}}}}", "}"
+  ).format(**format_args)
 
 events_count = 0
 used_zero_count = 0
 used_zero_queue = []
 dropped_used_zero_count = 0
 no_slots_count = 0
+
+notify_memset = '''
+  #pragma unroll
+  for (size_t i=0; i < sizeof(n); i++) {
+    ((char*)&n)[i] = 0;
+  }
+'''
 
 def main():
   args = parse_args()
@@ -322,6 +341,7 @@ def main():
     'cores': multiprocessing.cpu_count(),
     'is_included_pid': '',
     'is_excluded_pid': '',
+    'notify_memset': '',
   }
 
   if len(args.pids) > 1:
@@ -330,9 +350,10 @@ def main():
   if len(args.exclude) > 0:
     format_args['is_excluded_pid'] = gen_pid_in_list("is_excluded_pid", args.exclude)
 
-  text = """
+  code_template = """
 {{defines}}
 {{error_defines}}
+
 #include <bcc/proto.h>
 #include <linux/socket.h>
 #include <linux/uio.h>
@@ -389,7 +410,7 @@ struct scm_data {
   } content;
 };
 
-struct notify_t {
+typedef struct notify {
   u16 cpu;
   u16 type; // SOCK_STREAM, SOCK_DGRAM
   u32 index;
@@ -410,7 +431,7 @@ struct notify_t {
     size_t fill[14];
   } u;
   #endif
-};
+} notify_t;
 BPF_PERF_OUTPUT(output);
 
 // note: yet another hack to bypass some weird condition where the validator prefers
@@ -421,7 +442,7 @@ BPF_PERF_OUTPUT(output);
 #define BOOL_TYPE size_t
 #endif
 
-inline static void clear_scm(struct notify_t* n, size_t _i) {
+inline static void clear_scm(notify_t* n, size_t _i) {
   /*#pragma unroll
   for (size_t i = 0; i < ANCILLARY_COUNT; i++) {
     if (i >= _i) {
@@ -446,7 +467,7 @@ inline static void clear_scm(struct notify_t* n, size_t _i) {
   }
 }
 
-inline static void clear_scm_index(struct notify_t* n, size_t i) {
+inline static void clear_scm_index(notify_t* n, size_t i) {
   char* scm = (char*)&n->scm[i];
   #pragma unroll
   for (size_t j=0; j < sizeof(struct scm_data); j++) {
@@ -454,9 +475,9 @@ inline static void clear_scm_index(struct notify_t* n, size_t i) {
   }
 }
 
-inline static void notify(struct notify_t* n,
+inline static void notify(notify_t* n,
                           struct pt_regs* ctx) {
-  output.perf_submit(ctx, n, sizeof(struct notify_t));
+  output.perf_submit(ctx, n, sizeof(notify_t));
 }
 
 // magic to trick the validator
@@ -542,7 +563,7 @@ static inline struct cmsghdr* cmsg_nxthdr_x(struct msghdr* msg, struct cmsghdr* 
 
 static inline int process_cmsg(struct cmsghdr* real_cmsg,
                                struct cmsghdr* stack_cmsg,
-                               size_t i, struct notify_t* n) {
+                               size_t i, notify_t* n) {
   //clear_scm_index(n, i);
   if (stack_cmsg->cmsg_level == SOL_SOCKET) {
     n->scm[i].type = stack_cmsg->cmsg_type;
@@ -594,7 +615,12 @@ static inline int process_cmsg(struct cmsghdr* real_cmsg,
 }
 
 int kprobe__unix_stream_sendmsg(struct pt_regs *ctx, struct socket *sock, struct msghdr *msg){
-  struct notify_t n;
+  notify_t n;
+  {{notify_memset}}
+  /*#pragma unroll
+  for (size_t i=0; i < (sizeof(n)); i++) {
+    ((char*)&n)[i] = 0;
+  }*/
   n.cpu = bpf_get_smp_processor_id();
   n.type = SOCK_STREAM;
 
@@ -779,6 +805,8 @@ int kprobe__unix_stream_sendmsg(struct pt_regs *ctx, struct socket *sock, struct
         }
 
         if (process_cmsg(_cmsg, &cmsg, i, &n) != 0) {
+          n.error_code = CMSG_BAD;
+          n.error_msg = i;
           goto pre_index_error;
         }
 
@@ -919,7 +947,12 @@ end:
 }
 
 int kprobe__unix_dgram_sendmsg(struct pt_regs *ctx, struct socket *sock, struct msghdr *msg){
-  struct notify_t n;
+  notify_t n;
+  {{notify_memset}}
+  /*#pragma unroll
+  for (size_t i=0; i < sizeof(n); i++) {
+    ((char*)&n)[i] = 0;
+  }*/
   n.cpu = bpf_get_smp_processor_id();
   n.type = SOCK_DGRAM;
 
@@ -1191,6 +1224,8 @@ int kprobe__unix_dgram_sendmsg(struct pt_regs *ctx, struct socket *sock, struct 
         }
 
         if (process_cmsg(_cmsg, &cmsg, i, &n) != 0) {
+          n.error_code = CMSG_BAD;
+          n.error_msg = i;
           goto pre_index_error;
         }
 
@@ -1329,15 +1364,8 @@ end:
   return 0;
 }
 
-""".replace(
-    "{", "{{"
-  ).replace(
-    "}", "}}"
-  ).replace(
-    "{{{{", "{"
-  ).replace(
-    "}}}}", "}"
-  ).format(**format_args)
+"""
+  text = render_code(code_template, format_args)
 
   if args.preprocessonly:
     print(text)
@@ -1748,7 +1776,73 @@ command[{}]: {!r}
 
   #b = BPF(text=text).trace_print()
   #b = BPF(text=text, debug=0x8)
-  b = BPF(text=text)
+
+  libc = ctypes.CDLL('libc.so.6')
+  nstderr = libc.dup(2)
+  PipeInType = ctypes.c_int * 2
+  pipe_in = PipeInType(0,0)
+  p_pipe_in = ctypes.pointer(pipe_in)
+  libc.pipe(p_pipe_in)
+  libc.close(2)
+  r = libc.dup2(pipe_in[1], 2)
+
+  pipe_err_poll = select.poll()
+  pipe_err_poll.register(pipe_in[0], select.POLLIN | select.POLLPRI)
+
+  b = None
+  err_buf = b""
+  e = None
+  try:
+    b = BPF(text=text)
+  except Exception as _e:
+    e = _e
+    while True:
+      poll_res = pipe_err_poll.poll(1)
+      if len(poll_res) == 0:
+        break
+      err_buf += os.read(pipe_in[0], 1024)
+
+  if e != None and str(e).find("Failed to load") != -1:
+    if args.debug:
+      print("[debug] First attempt to load program failed")
+      os.write(nstderr, err_buf)
+      print(str(e))
+
+    err_buf = err_buf.decode('utf-8').strip()
+    err_lines = err_buf.split('\n')
+    if err_lines[-2].startswith("invalid indirect read from stack"):
+      if args.debug:
+        print("[debug] Trying again with notify_t memset")
+      format_args['notify_memset'] = notify_memset
+      text = render_code(code_template, format_args)
+
+      e = None
+      nerr_buf = b"" # for extra debugging, we will probably want both error messages in case they are different
+      try:
+        b = BPF(text=text)
+      except Exception as _e:
+        while True:
+          poll_res = pipe_err_poll.poll(1)
+          if len(poll_res) == 0:
+            break
+          nerr_buf += os.read(pipe_in[0], 1024)
+        if args.debug:
+          print("[debug] Second attempt to load program (with notify_t memset) failed")
+          os.write(nstderr, err_buf)
+          print(str(_e))
+        #nerr_buf = nerr_buf.decode('utf-8').strip()
+
+  libc.close(pipe_in[1])
+  libc.close(pipe_in[0])
+  libc.close(2)
+  libc.dup2(nstderr, 2)
+  libc.close(nstderr)
+
+  if e != None:
+    if not args.debug:
+      print(err_buf, file=sys.stderr)
+      print(str(e))
+    sys.exit(1)
 
   py_ring = b["ring_buf"]
   b["output"].open_perf_buffer(print_event, page_cnt=PAGECNT)

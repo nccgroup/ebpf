@@ -16,19 +16,34 @@ including ancillary data, such as file descriptors and Unix credentials.
 [BCC install instructions](https://github.com/iovisor/bcc/blob/master/INSTALL.md)
 for your distribution. We recommend building and installing BCC from
 [source](https://github.com/iovisor/bcc/blob/master/INSTALL.md#source).
-<!-- sudo apt install bison build-essential cmake flex git libedit-dev clang libclang-dev python2.7 zlib1g-dev libelf-dev luajit libluajit-5.1-dev git-->
 
-***Note:*** While BCC updates may result in breakages, `unixdump` is known to
-work with versions [0.8.0](https://github.com/iovisor/bcc/releases/tag/v0.8.0)
-on Ubuntu 18.04 and [0.7.0](https://github.com/iovisor/bcc/releases/tag/v0.7.0)
-on Ubuntu 18.04 and Kali. If you are having issues with `unixdump`, please make
-sure you are not running an out-of-date version of BCC.
-
+***Note:*** While BCC updates may result in breakages, the current version of
+`unixdump` is known to work with version [0.24.0](https://github.com/iovisor/bcc/releases/tag/v0.24.0)
+on Ubuntu 20.04 when using clang/llvm 10 from <https://apt.llvm.org/> (bcc's
+build hardcodes llvm 10 paths). If you are having issues with `unixdump`,
+please make sure you are not running an out-of-date version of BCC (such as if
+you installed the [Ubuntu packages](https://github.com/iovisor/bcc/blob/master/INSTALL.md#ubuntu---binary)).
 
 ## unixdump
 
+
+### Via pip
+
 ```
-sudo -H pip install unixdump
+sudo -H pip3 install unixdump
+```
+
+### From source
+
+```
+sudo python3 setup.py install
+```
+
+or
+
+```
+python3 setup.py bdist_wheel
+sudo -H pip3 install ./dist/unixdump-*.whl
 ```
 
 # Usage
@@ -50,7 +65,7 @@ socket with random characters that begins with `/tmp/domain-socket-`. We can
 limit our output to only sockets beginning with that string:
 
 ```
-sudo unixdump -b '/tmp/domain-socket'
+sudo unixdump -b -s '/tmp/domain-socket'
 ```
 
 The output can be further restricted using combinations of `unixdump` filter
@@ -61,17 +76,17 @@ options.
 `unixdump` provides many different arguments to filter output and fine tune
 performance. Below are some of the more notable options:
 
-- `-b, --beginswith`: One of `unixdump`'s most useful filters is to match starting
-sequences of socket paths. This proves extremely helpful when the program creates 
-socket paths ending with random characters yet the beginning is unique and constant.
-This makes filtering possible without knowing the entire socket name ahead of time.
-
 - `-s, --socket`: When the user knows the exact name of the socket path, this is 
 the option to use. By specifying an empty string like so `-s ''`, `unixdump`
 will filter on unnamed sockets.
 
 - `-@, --base64`: To filter on binary abstract namespace keys, this option
 instructs `unixdump` to parse the `-b`/`-s` options as base64.
+
+- `-b, --beginswith`: One of `unixdump`'s most useful filters is to match starting
+sequences of socket paths. This proves extremely helpful when the program creates 
+socket paths ending with random characters yet the beginning is unique and constant.
+This makes filtering possible without knowing the entire socket name ahead of time.
 
 - `-p, --pid`: To home in on a specific process (and anything communicating
 with it), use this option.

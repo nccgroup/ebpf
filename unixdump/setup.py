@@ -1,13 +1,11 @@
 import sys
-if sys.version_info < (2, 7):
-    sys.exit('unixdump requires Python 2.7+')
 
 from setuptools import setup
 
 setup(
   name='unixdump',
-  version='1.0.0',
-  description='eBPF-based tcpdump-alike for Unix domain sockets',
+  version='1.1.0',
+  description='eBPF-based namespace-agnostic tcpdump-alike for Unix domain sockets',
   long_description=open('README.md').read(),
   long_description_content_type='text/markdown',
   author='Andy Olsen, Jeff Dileo',
@@ -15,7 +13,7 @@ setup(
   url='https://github.com/nccgroup/ebpf',
   license='GPLv2 (Only)/BSD (2 Clause)',
 
-  python_requires='>=2.7.0, !=3.*',
+  python_requires='>=3.5.0',
   #platforms=['linux'], #ignored by setuptools/distutils
   install_requires=[
     'pybst >=1.0, <2',
