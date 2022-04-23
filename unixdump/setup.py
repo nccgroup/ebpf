@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
   name='unixdump',
-  version='1.1.0',
+  version='1.1.1',
   description='eBPF-based namespace-agnostic tcpdump-alike for Unix domain sockets',
   long_description=open('README.md').read(),
   long_description_content_type='text/markdown',
