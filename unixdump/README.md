@@ -26,6 +26,25 @@ you installed the [Ubuntu packages](https://github.com/iovisor/bcc/blob/master/I
 
 ## unixdump
 
+### Quickstart
+
+```
+$ docker run --rm -it --privileged -v /lib/modules:/lib/modules:ro -v /sys:/sys -v /usr/src:/usr/src:ro alpine:edge
+/ # apk add bcc-tools bcc-doc py3-pip procps
+...
+/ # pip install unixdump
+...
+/ # # [leave shell open]
+```
+
+```
+$ sudo nsenter -a -t <container pid> /bin/sh
+/ # unixdump -s /run/docker.sock
+```
+
+```
+$ docker ps
+```
 
 ### Via pip
 
