@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
   name='unixdump',
-  version='1.1.1',
+  version='1.2.0',
   description='eBPF-based namespace-agnostic tcpdump-alike for Unix domain sockets',
   long_description=open('README.md').read(),
   long_description_content_type='text/markdown',
@@ -31,7 +31,7 @@ setup(
   classifiers=[
     'License :: OSI Approved :: GNU General Public License v2 (GPLv2)',
     'License :: OSI Approved :: BSD License',
-    'Programming Language :: Python :: 2.7',
+    'Programming Language :: Python :: 3.5',
     'Operating System :: POSIX :: Linux',
     'Topic :: System :: Networking :: Monitoring',
     'Topic :: System :: Operating System Kernels :: Linux',

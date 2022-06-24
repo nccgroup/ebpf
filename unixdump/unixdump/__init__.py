@@ -21,6 +21,7 @@ import ctypes
 import hexdump
 import sys
 import time
+import fcntl
 
 from base64 import b64decode
 from binascii import hexlify
@@ -29,7 +30,6 @@ from subprocess import check_output, CalledProcessError
 import os
 import select
 import multiprocessing
-
 
 errors = {
   'SK_NOT_UNIX': 1,
@@ -84,6 +84,8 @@ def parse_args():
   parser.add_argument("-v", "--verbose", action='store_true', help="disables metadata elision")
   parser.add_argument("-z", "--stats", action='store_true', help="debug stats output")
   parser.add_argument("-d", "--debug", action='store_true', help="debug output")
+  parser.add_argument("-L", "--debug-log-level", type=int, default=4, help="bpf log_level to use if --debug is set. defaults to BPF_LOG_STATS (4).")
+  parser.add_argument("-D", "--debug-log-size", type=int, default=65536, help="bpf log_buf_size to use if --debug is set. defaults to 65536. if enabling further logging with -L 1, 2, 3, 5, 6, or 7 defaults to at least 20000000")
   parser.add_argument("-y", "--retry", type=int, default=5, help="number of retry attempts for incomplete events")
   parser.add_argument("-l", "--ancillarydata", action='store_true', help="filter for ancillary data")
   parser.add_argument("-E", "--preprocessonly", action='store_true', help="output bcc C code and exit")
@@ -516,9 +518,12 @@ static inline bool cmp_sun_path(char* str, size_t len) {
   size_t const stop = sizeof(needle)-1;
   #endif
 
+  volatile char const* _needle = needle;
+  volatile char const* _haystack = haystack;
+
   #pragma unroll
   for (int i = 0; i < stop; ++i) {
-    if (needle[i] != haystack[i]) {
+    if (_needle[i] != _haystack[i]) {
       return false;
     }
   }
@@ -535,10 +540,7 @@ static inline bool cmp_sun_path(char* str, size_t len) {
 #endif
 
 inline static void copy_into_entry_buffer(data_t* entry, size_t const len, char* base, u8 volatile* trunc) {
-  int l = (int)len;
-  if (l < 0) {
-    l = 0;
-  }
+  size_t l = len & 0x1fff;
   if (l >= BUFFER_SIZE) {
     *trunc = 1;
   }
@@ -1783,11 +1785,43 @@ command[{}]: {!r}
   pipe_in = PipeInType(0,0)
   p_pipe_in = ctypes.pointer(pipe_in)
   libc.pipe(p_pipe_in)
+  log_level = args.debug_log_level
+  log_buf_size = args.debug_log_size
+  if log_level in [1, 2, 3, 5, 6, 7]:
+    if log_buf_size < 20000000:
+      log_buf_size = 20000000
+  fcntl.fcntl(pipe_in[1], fcntl.F_SETPIPE_SZ, log_buf_size*2)
   libc.close(2)
   r = libc.dup2(pipe_in[1], 2)
 
   pipe_err_poll = select.poll()
   pipe_err_poll.register(pipe_in[0], select.POLLIN | select.POLLPRI)
+
+  if args.debug:
+    #note: bcc doesn't normally pass in a log_buf, so we hook the call into its
+    #      libbpf shim to add one
+    import bcc
+    real_bcc_func_load = bcc.lib.bcc_func_load
+    def fake_bcc_func_load(*argv):
+      if argv[8] == None and argv[9] == 0:
+        try:
+          log_buf = ctypes.create_string_buffer(log_buf_size)
+          nargv = list(argv)
+          nargv[7] = log_level
+          nargv[8] = log_buf
+          nargv[9] = log_buf_size
+          fd = real_bcc_func_load(*nargv)
+          if fd >= 0:
+            sys.stdout.buffer.write(log_buf.value)
+            sys.stdout.buffer.flush()
+          else:
+            #note: it gets printed by bcc/src/cc/libbpf.c's bpf_print_hints
+            pass
+          return fd
+        except Exception as e:
+          print(e)
+      return real_bcc_func_load(*argv)
+    bcc.lib.bcc_func_load = fake_bcc_func_load
 
   b = None
   err_buf = b""
@@ -1796,11 +1830,13 @@ command[{}]: {!r}
     b = BPF(text=text)
   except Exception as _e:
     e = _e
+    err_buf_chunks = []
     while True:
-      poll_res = pipe_err_poll.poll(1)
+      poll_res = pipe_err_poll.poll(5000)
       if len(poll_res) == 0:
         break
-      err_buf += os.read(pipe_in[0], 1024)
+      err_buf_chunks.append(os.read(pipe_in[0], 8192))
+    err_buf += b''.join(err_buf_chunks)
 
   if e != None and str(e).find("Failed to load") != -1:
     if args.debug:
